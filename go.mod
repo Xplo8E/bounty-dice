@@ -1,4 +1,4 @@
-module bounty-dice
+module github.com/xplo8e/bounty-dice
 
 go 1.24.0
 
