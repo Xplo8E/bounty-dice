@@ -3,8 +3,8 @@ package main
 
 import (
 	"bufio"
-	"bounty-dice/pkg/client"
-	"bounty-dice/pkg/random"
+	"github.com/xplo8e/bounty-dice/pkg/client"
+	"github.com/xplo8e/bounty-dice/pkg/random"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
