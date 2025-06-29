@@ -3,8 +3,6 @@ package main
 
 import (
 	"bufio"
-	"github.com/xplo8e/bounty-dice/pkg/client"
-	"github.com/xplo8e/bounty-dice/pkg/random"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -19,6 +17,9 @@ import (
 	"github.com/briandowns/spinner"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/sw33tLie/bbscope/pkg/scope"
+	"github.com/xplo8e/bounty-dice/pkg/client"
+	"github.com/xplo8e/bounty-dice/pkg/hq"
+	"github.com/xplo8e/bounty-dice/pkg/random"
 )
 
 // Mission struct to hold state
@@ -28,10 +29,11 @@ type Mission struct {
 	EndDate     time.Time         `json:"end_date"`
 	RerollCount int               `json:"reroll_count"`
 	Duration    int               `json:"duration"`
+	HQFindings  []string          `json:"hq_findings,omitempty"`
 }
 
 const (
-	maxRerolls      = 5
+	maxRerolls     = 5
 	minMissionDays = 15
 	maxMissionDays = 30
 )
@@ -50,6 +52,7 @@ var (
 	styleCommitment = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("#FFD700"))
 	styleProbability = lipgloss.NewStyle().Foreground(lipgloss.Color("#228B22"))
 	styleWarning  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF6347"))
+	styleVerbose = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
 	// Motivational Messages
 	motivations = []string{
@@ -61,21 +64,31 @@ var (
 	}
 )
 
+var verboseLog *bool
+
+func logVerbose(format string, a ...interface{}) {
+	if verboseLog != nil && *verboseLog {
+		fmt.Println(styleVerbose.Render(fmt.Sprintf(format, a...)))
+	}
+}
+
 func init() {
 	missionFilePath = letsStart()
 }
 
 func letsStart() string {
-	en := "LmJvdW50eV9taXNzaW9uLmpzb24=" 
-	de, err := base64.StdEncoding.DecodeString(en)
+	en := "LmJvdW50eV9taXNzaW9uLmpzb24="
+	de, _ := base64.StdEncoding.DecodeString(en)
 	fileName := string(de)
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Println("Error finding home directory:", err)
+		logVerbose("Error finding home directory: %v. Using current directory.", err)
 		return fileName
 	}
-	return filepath.Join(homeDir, fileName)
+	path := filepath.Join(homeDir, fileName)
+	logVerbose("Mission file path set to: %s", path)
+	return path
 }
 
 func main() {
@@ -83,9 +96,154 @@ func main() {
 	bounty := flag.Bool("bounty", false, "Roll the dice only for programs that offer bounties")
 	scopeFilter := flag.String("scope", "all", "Filter by scope (e.g., url, cidr, mobile, android, apple, ai, other, hardware, code, executable)")
 	duration := flag.Int("duration", 15, "Set the mission duration in days (min: 15, max: 30)")
+	hqFlag := flag.Bool("hq", false, "Use high-quality program fetching logic")
+	force := flag.Bool("force", false, "Force re-fetch list of programs and program data")
+	minReq := flag.Int("min-req", 1, "Minimum number of identified features required to highlight a program in the output")
+	sessionCookie := flag.String("session", "", "__Host-session cookie value from hackerone.com")
+	csrfToken := flag.String("token", "", "X-Csrf-Token value")
+	verbose := flag.Bool("v", false, "Enable verbose output")
 	flag.Parse()
 
+	verboseLog = verbose
+	client.SetVerbose(*verbose)
+	hq.SetVerbose(*verbose)
+	random.SetVerbose(*verbose)
+	logVerbose("Verbose mode enabled.")
+	logVerbose("Reroll: %t, Bounty: %t, Scope: %s, Duration: %d, HQ: %t, Force: %t, Min-Req: %d", *reroll, *bounty, *scopeFilter, *duration, *hqFlag, *force, *minReq)
+	if *sessionCookie != "" {
+		logVerbose("HackerOne session cookie provided.")
+	}
+	if *csrfToken != "" {
+		logVerbose("HackerOne CSRF token provided.")
+	}
+
+	var currentRerollCount int
+	mission, err := loadMission()
+	if err == nil {
+		currentRerollCount = mission.RerollCount
+		logVerbose("Loaded existing mission. Current reroll count: %d", currentRerollCount)
+	} else {
+		logVerbose("No existing mission found or error loading: %v", err)
+	}
+
+	// Check for existing mission FIRST, unless rerolling
+	if !*reroll && err == nil {
+		if time.Now().Before(mission.EndDate) {
+			logVerbose("Active mission found and it's not expired. Displaying it.")
+			displayActiveMission(mission)
+			return // <-- Exit early
+		} else {
+			logVerbose("Mission found, but it has expired. Resetting reroll counter.")
+			mission.RerollCount = 0
+			saveMission(mission)
+			currentRerollCount = 0 // Reset for the new roll
+		}
+	}
+
+	if *hqFlag {
+		logVerbose("High-quality mode activated.")
+		s := spinner.New(spinner.CharSets[11], 100*time.Millisecond)
+		s.Suffix = " Fetching programs...\n"
+		s.Color("fgHiCyan")
+		s.Start()
+
+		apiUser := os.Getenv("HACKERONE_API_USER")
+		apiToken := os.Getenv("HACKERONE_API_TOKEN")
+		authString := apiUser + ":" + apiToken
+		encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+		allPrograms, err := getPrograms(encodedAuth, *bounty, *scopeFilter)
+		if err != nil {
+			s.Stop()
+			fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
+				styleAppTitle.String(),
+				styleLabel.Render(fmt.Sprintf("\nError fetching programs: %v", err)),
+			)))
+			os.Exit(1)
+		}
+		s.Stop()
+		logVerbose("Fetched %d programs initially.", len(allPrograms))
+
+		if len(allPrograms) == 0 {
+			fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
+				styleAppTitle.String(),
+				styleLabel.Render("\nNo programs found matching your criteria. Try different filters!"),
+			)))
+			os.Exit(0)
+		}
+
+		var handles []string
+		for _, p := range allPrograms {
+			handles = append(handles, strings.TrimPrefix(p.Url, "https://hackerone.com/"))
+		}
+		logVerbose("Extracted %d handles for high-quality checking.", len(handles))
+
+		s.Suffix = " Finding high-quality programs...\n"
+        s.Start()
+        session := hq.NewSession(*sessionCookie, *csrfToken)
+        hqProgramsResult, err := hq.FetchAndCheck(session, handles, *force, *minReq)
+        if err != nil {
+            s.Stop()
+            fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
+                styleAppTitle.String(),
+                styleLabel.Render(fmt.Sprintf("\nError fetching high-quality programs: %v", err)),
+            )))
+            os.Exit(1)
+        }
+        s.Stop()
+        logVerbose("Found %d high-quality programs.", len(hqProgramsResult))
+
+        var hqPrograms []scope.ProgramData
+        var hqProgramMap = make(map[string][]string)
+
+        for _, hqProg := range hqProgramsResult {
+            hqProgramMap[hqProg.Handle] = hqProg.Findings
+        }
+
+        for _, p := range allPrograms {
+            if _, ok := hqProgramMap[strings.TrimPrefix(p.Url, "https://hackerone.com/")]; ok {
+                hqPrograms = append(hqPrograms, p)
+            }
+        }
+
+        logVerbose("Filtered down to %d high-quality programs matching initial criteria.", len(hqPrograms))
+
+        if len(hqPrograms) == 0 {
+            fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
+                styleAppTitle.String(),
+                styleLabel.Render("\nNo high-quality programs found matching your criteria. Try different filters!"),
+            )))
+            os.Exit(0)
+        }
+
+        logVerbose("Selecting a random program from the high-quality list.")
+        randomProgram, err := random.Select(hqPrograms)
+        if err != nil {
+            fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
+                styleAppTitle.String(),
+                styleLabel.Render(fmt.Sprintf("\nError selecting random program: %v", err)),
+            )))
+            os.Exit(1)
+        }
+
+        randomProgramHandle := strings.TrimPrefix(randomProgram.Url, "https://hackerone.com/")
+        findings := hqProgramMap[randomProgramHandle]
+
+        newMission := Mission{
+            Program:     randomProgram,
+            StartDate:   time.Now(),
+            EndDate:     time.Now().Add(time.Duration(*duration) * 24 * time.Hour),
+            RerollCount: currentRerollCount,
+            Duration:    *duration,
+            HQFindings:  findings,
+        }
+        saveMission(newMission)
+        logVerbose("New mission created and saved for program: %s", randomProgram.Url)
+        displayNewMission(newMission, len(hqPrograms))
+        return
+    }
+
 	if *duration < minMissionDays || *duration > maxMissionDays {
+		logVerbose("Duration %d is outside the allowed range (%d-%d days).", *duration, minMissionDays, maxMissionDays)
 		fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
 			styleHeader.Render("INVALID DURATION"),
 			"",
@@ -95,27 +253,10 @@ func main() {
 		return
 	}
 
-	mission, err := loadMission()
-
-	// Check for existing mission
-	if !*reroll && err == nil {
-		if time.Now().Before(mission.EndDate) {
-			displayActiveMission(mission)
-			return
-		} else {
-			// Mission is complete, reset reroll counter
-			mission.RerollCount = 0
-			saveMission(mission)
-		}
-	}
-
-	currentRerollCount := 0
-	if err == nil {
-		currentRerollCount = mission.RerollCount
-	}
-
 	if *reroll {
+		logVerbose("Reroll flag is set. Initiating reroll process.")
 		if currentRerollCount >= maxRerolls {
+			logVerbose("User has reached the maximum reroll limit of %d.", maxRerolls)
 			fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
 				styleHeader.Render("REROLL LOCKOUT"),
 				"",
@@ -147,36 +288,30 @@ func main() {
 		}
 
 		if !confirmed {
+			logVerbose("User aborted the reroll process.")
 			fmt.Println("\nMission aborted. Your current mission remains active. A wise choice.")
 			return
 		}
 
+		logVerbose("User confirmed reroll. Removing old mission file and incrementing reroll count.")
 		fmt.Println(styleCommitment.Render("\nFocus broken. Reroll charge consumed..."))
 		os.Remove(missionFilePath)
 		currentRerollCount++
 	}
 
 	// --- Start New Mission ---
-	apiUser := os.Getenv("HACKERONE_API_USER")
-	apiToken := os.Getenv("HACKERONE_API_TOKEN")
-
-	if apiUser == "" || apiToken == "" {
-		fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
-			styleAppTitle.String(),
-			styleLabel.Render("\nError: HACKERONE_API_USER and HACKERONE_API_TOKEN must be set."),
-		)))
-		os.Exit(1)
-	}
-
-	authString := apiUser + ":" + apiToken
-	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
-
 	s := spinner.New(spinner.CharSets[11], 100*time.Millisecond)
-	s.Suffix = " Rolling the dice..."
+	s.Suffix = " Rolling the dice...\n"
 	s.Color("fgHiCyan")
 	s.Start()
 
-	programs, err := client.GetPrograms(encodedAuth, *bounty, *scopeFilter)
+	apiUser := os.Getenv("HACKERONE_API_USER")
+	apiToken := os.Getenv("HACKERONE_API_TOKEN")
+	authString := apiUser + ":" + apiToken
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+
+	logVerbose("Fetching programs for a new mission.")
+	programs, err := getPrograms(encodedAuth, *bounty, *scopeFilter)
 	if err != nil {
 		s.Stop()
 		fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
@@ -186,6 +321,7 @@ func main() {
 		os.Exit(1)
 	}
 	s.Stop()
+	logVerbose("Fetched %d programs.", len(programs))
 
 	if len(programs) == 0 {
 		fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
@@ -195,6 +331,7 @@ func main() {
 		os.Exit(0)
 	}
 
+	logVerbose("Selecting a random program.")
 	randomProgram, err := random.Select(programs)
 	if err != nil {
 		fmt.Println(styleBox.Render(lipgloss.JoinVertical(lipgloss.Left,
@@ -213,37 +350,69 @@ func main() {
 		Duration:    *duration,
 	}
 	saveMission(newMission)
+	logVerbose("New mission created and saved for program: %s", randomProgram.Url)
 
 	// Display the new mission briefing
 	displayNewMission(newMission, len(programs))
 }
 
+func getPrograms(encodedAuth string, bounty bool, scopeFilter string) ([]scope.ProgramData, error) {
+	logVerbose("Getting programs with bounty: %t, scope: %s", bounty, scopeFilter)
+	if os.Getenv("HACKERONE_API_USER") == "" || os.Getenv("HACKERONE_API_TOKEN") == "" {
+		return nil, fmt.Errorf("HACKERONE_API_USER and HACKERONE_API_TOKEN must be set")
+	}
+	programs, err := client.GetPrograms(encodedAuth, bounty, scopeFilter)
+	if err != nil {
+		logVerbose("Error from client.GetPrograms: %v", err)
+	} else {
+		logVerbose("client.GetPrograms returned %d programs", len(programs))
+	}
+	return programs, err
+}
+
 func loadMission() (Mission, error) {
+	logVerbose("Attempting to load mission from %s", missionFilePath)
 	var mission Mission
 	data, err := os.ReadFile(missionFilePath)
 	if err != nil {
+		logVerbose("Failed to read mission file: %v", err)
 		return Mission{}, err
 	}
 	err = json.Unmarshal(data, &mission)
+	if err != nil {
+		logVerbose("Failed to unmarshal mission JSON: %v", err)
+	} else {
+		logVerbose("Successfully loaded mission for program: %s", mission.Program.Url)
+	}
 	return mission, err
 }
 
 func saveMission(mission Mission) {
+	logVerbose("Saving mission for program: %s to %s", mission.Program.Url, missionFilePath)
 	data, err := json.MarshalIndent(mission, "", "  ")
 	if err != nil {
+		logVerbose("Error marshalling mission to JSON: %v", err)
 		fmt.Println("Error saving mission:", err)
 		return
 	}
-	os.WriteFile(missionFilePath, data, 0644)
+	err = os.WriteFile(missionFilePath, data, 0644)
+	if err != nil {
+		logVerbose("Error writing mission file: %v", err)
+		fmt.Println("Error saving mission:", err)
+	} else {
+		logVerbose("Mission saved successfully.")
+	}
 }
 
 func displayActiveMission(mission Mission) {
+	logVerbose("Displaying active mission for program: %s", mission.Program.Url)
 	daysRemaining := int(math.Ceil(time.Until(mission.EndDate).Hours() / 24))
 
 	// For backward compatibility with missions created before the duration field
 	missionDuration := mission.Duration
 	if missionDuration == 0 {
 		missionDuration = int(mission.EndDate.Sub(mission.StartDate).Hours() / 24)
+		logVerbose("Mission duration not found, calculating from dates: %d days", missionDuration)
 	}
 
 	header := styleHeader.Render("ACTIVE MISSION BRIEFING")
@@ -277,9 +446,11 @@ func displayActiveMission(mission Mission) {
 }
 
 func displayNewMission(mission Mission, totalPrograms int) {
-	rand.Seed(time.Now().UnixNano())
+	logVerbose("Displaying new mission for program: %s", mission.Program.Url)
+	logVerbose("Total programs considered for this roll: %d", totalPrograms)
 	motivation := motivations[rand.Intn(len(motivations))]
 	probability := (1.0 / float64(totalPrograms)) * 100
+	logVerbose("Calculated probability: %.2f%%", probability)
 
 	var scopeLines []string
 	for i, s := range mission.Program.InScope {
